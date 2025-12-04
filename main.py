@@ -1,162 +1,141 @@
 # main.py
 import os
 import time
-import asyncio
-from typing import Optional
+from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 from aiocache import cached, Cache
 
+# Load local .env for development
 load_dotenv()
+
 TIKTOK_CLIENT_KEY = os.getenv("TIKTOK_CLIENT_KEY")
 TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET")
-TIKAPI_KEY = os.getenv("TIKAPI_KEY")
-USE_UNOFFICIAL = os.getenv("USE_UNOFFICIAL", "false").lower() in ("1","true","yes")
+USE_UNOFFICIAL = os.getenv("USE_UNOFFICIAL", "false").lower() in ("1", "true", "yes")
 
 templates = Jinja2Templates(directory="templates")
 app = FastAPI(title="TikIQ - TikTok vidIQ (Python)")
 
-# Basic caching for results (avoid hitting API rate limits repeatedly)
-CACHE_TTL = 60  # seconds; tune for production
+# Cache TTLs
+SHORT_TTL = 30
+MED_TTL = 120
 
-# Helper: call official Research API (example: query video)
-async def call_tiktok_research(endpoint: str, params: dict):
-    """
-    Uses client credentials flow or configured method to call official TikTok Research API endpoints.
-    Replace with required auth per TikTok docs. (This function is intentionally generic.)
-    """
+# Helper: standardized error for missing config
+def require_official_credentials():
     if not (TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET):
-        raise RuntimeError("TikTok developer credentials not configured.")
-    # NOTE: The exact auth flow depends on which TikTok API you're using (Research, Display, etc.).
-    # Here we demonstrate a client-access pattern with API key in headers.
-    url = f"https://open.tiktokapis.com/{endpoint.lstrip('/')}"
+        raise RuntimeError("Official TikTok API credentials are not configured. Set TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET.")
+
+# ========== Official TikTok API helper (generic) ==========
+# NOTE: TikTok has multiple API products (Research, Display, etc.) with slightly different hostnames and auth.
+# The endpoint paths used here are illustrative — replace with the exact endpoints from the TikTok Developer docs
+# once you register an app and pick the API product you want.
+async def call_tiktok_official(path: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    """
+    Generic call helper for TikTok official API endpoints.
+    Replace `api_host` and exact auth header requirements according to the API product you selected.
+    """
+    require_official_credentials()
+    params = params or {}
+    # Example host; verify the correct host for the API product you use
+    api_host = os.getenv("TIKTOK_API_HOST", "https://open.tiktokapis.com")
+    url = api_host.rstrip("/") + path
     headers = {
-        "x-client-key": TIKTOK_CLIENT_KEY,  # placeholder header — replace per TikTok docs
+        # Official auth could be OAuth Bearer or a client-key header depending on product.
+        # Many endpoints require OAuth; for server-to-server Research calls, use the keys you were given.
+        "x-client-key": TIKTOK_CLIENT_KEY
     }
     async with httpx.AsyncClient(timeout=20) as client:
         resp = await client.get(url, params=params, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
-# Helper: fallback using tikapi (managed API) or TikTokApi (unofficial)
-async def fallback_get_user(username: str, count: int = 5):
-    # Prefer managed API if key available
-    if TIKAPI_KEY:
-        async with httpx.AsyncClient() as client:
-            url = "https://api.tikapi.io/user/info"  # example endpoint; real path may differ
-            headers = {"x-api-key": TIKAPI_KEY}
-            resp = await client.get(url, params={"username": username}, headers=headers, timeout=20)
-            resp.raise_for_status()
-            return resp.json()
-    if USE_UNOFFICIAL:
-        # Import here to avoid import errors if not installed
-        try:
-            from TikTokApi import TikTokApi
-        except Exception as e:
-            raise RuntimeError("Unofficial TikTokApi not installed or failed to import.") from e
-        with TikTokApi() as api:
-            user = api.user(username=username)
-            videos = []
-            for v in user.videos(count=count):
-                videos.append({
-                    "id": v.id,
-                    "create_time": v.create_time,
-                    "stats": v.stats,
-                    "desc": v.desc
-                })
-            return {"user": {"uniqueId": username}, "videos": videos}
-    raise RuntimeError("No available TikTok data source configured.")
+# ========== Fallback simple functions ==========
+async def fallback_user_lookup(username: str, count: int = 5) -> Dict[str, Any]:
+    """
+    Fallback helper: returns a friendly message explaining how to enable the official API.
+    (We avoid adding unreliable scrapers by default.)
+    """
+    return {
+        "error": "no_fallback",
+        "message": "No official credentials configured. To enable data, set TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET. "
+                   "If you want an unofficial scraper fallback, set USE_UNOFFICIAL=true and install a scraper client (not recommended).",
+        "username": username
+    }
 
-# API endpoints
-
+# ========== API Endpoints ==========
 @app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
+async def ui_index(request: Request):
+    # Dashboard home
     return templates.TemplateResponse("index.html", {"request": request})
 
+@app.get("/dashboard/{username}", response_class=HTMLResponse)
+async def dashboard_user(request: Request, username: str):
+    # Render a dashboard page for username; the page will call our JSON endpoints for details
+    return templates.TemplateResponse("dashboard.html", {"request": request, "username": username})
+
 @app.get("/api/search_user")
-@cached(ttl=CACHE_TTL, cache=Cache.MEMORY)
-async def api_search_user(username: str, count: int = 5):
+@cached(ttl=MED_TTL, cache=Cache.MEMORY)
+async def api_search_user(username: str = Query(..., min_length=1), count: int = 5):
     """
-    Returns profile + recent videos for the username.
-    Tries official Research API first, then fallbacks.
+    Returns profile + recent videos for `username`.
+    Priority:
+      1) official TikTok API (if credentials configured)
+      2) fallback message (no scraping enabled by default)
     """
-    # Try official Research API (example path)
     try:
         if TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET:
-            # Example: Use research API to query videos by username
-            # Real endpoints and param names may differ — check TikTok docs.
-            resp = await call_tiktok_research("/v2/video/query", {"username": username, "count": count})
+            # NOTE: the path and params must match the TikTok API product you enabled.
+            # Replace '/v2/user/search' with the correct endpoint.
+            resp = await call_tiktok_official("/v2/user/search", {"username": username, "count": count})
             return JSONResponse(content={"source": "official", "data": resp})
-    except Exception as e:
-        # log and continue to fallback
-        print("Official API failed:", str(e))
-
-    # fallback
-    try:
-        data = await fallback_get_user(username, count=count)
-        return JSONResponse(content={"source": "fallback", "data": data})
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to fetch user: {e}")
+    except httpx.HTTPStatusError as e:
+        # pass through TikTok API error
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception:
+        # try fallback
+        fallback = await fallback_user_lookup(username, count)
+        return JSONResponse(content={"source": "fallback", "data": fallback})
 
 @app.get("/api/video_stats")
-@cached(ttl=CACHE_TTL, cache=Cache.MEMORY)
-async def api_video_stats(video_id: str):
+@cached(ttl=SHORT_TTL, cache=Cache.MEMORY)
+async def api_video_stats(video_id: str = Query(..., min_length=1)):
     """
-    Returns metrics for a video id.
+    Returns metrics for a video by id.
     """
     try:
         if TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET:
-            resp = await call_tiktok_research("/v2/video/query", {"item_id": video_id})
+            resp = await call_tiktok_official("/v2/video/query", {"item_id": video_id})
             return JSONResponse(content={"source": "official", "data": resp})
-    except Exception as e:
-        print("Official video query failed:", e)
-
-    # fallback to tikapi or unofficial
-    if TIKAPI_KEY:
-        async with httpx.AsyncClient() as client:
-            url = f"https://api.tikapi.io/video/{video_id}"
-            headers = {"x-api-key": TIKAPI_KEY}
-            r = await client.get(url, headers=headers, timeout=20)
-            r.raise_for_status()
-            return JSONResponse(content={"source": "tikapi", "data": r.json()})
-    if USE_UNOFFICIAL:
-        try:
-            from TikTokApi import TikTokApi
-            with TikTokApi() as api:
-                v = api.video(id=video_id)
-                return JSONResponse(content={"source": "unofficial", "data": v.as_dict()})
-        except Exception as e:
-            print("Unofficial video fetch error:", e)
-
-    raise HTTPException(status_code=500, detail="No data source available for video stats.")
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception:
+        return JSONResponse(content={"source": "fallback", "data": {"error": "no_fallback", "video_id": video_id}})
 
 @app.get("/api/trending_hashtags")
-@cached(ttl=120, cache=Cache.MEMORY)
-async def trending_hashtags(count: int = 20):
+@cached(ttl=MED_TTL, cache=Cache.MEMORY)
+async def api_trending_hashtags(count: int = 20):
     """
-    Best-effort trending hashtags list; try official display/research APIs, else fallback to managed API.
+    Best-effort trending hashtags.
     """
     try:
         if TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET:
-            resp = await call_tiktok_research("/v2/discover/hashtags", {"count": count})
-            return JSONResponse(content={"source":"official","data":resp})
-    except Exception as e:
-        print("Official hashtags query failed:", e)
+            resp = await call_tiktok_official("/v2/discover/hashtags", {"count": count})
+            return JSONResponse(content={"source": "official", "data": resp})
+    except Exception:
+        return JSONResponse(content={"source": "fallback", "data": {"error": "no_fallback"}})
 
-    if TIKAPI_KEY:
-        async with httpx.AsyncClient() as client:
-            url = "https://api.tikapi.io/trending/hashtags"
-            headers = {"x-api-key": TIKAPI_KEY}
-            r = await client.get(url, headers=headers, params={"count": count}, timeout=20)
-            r.raise_for_status()
-            return JSONResponse(content={"source":"tikapi","data":r.json()})
-    # fallback: best-effort web-scrape via unofficial library (not implemented here)
-    raise HTTPException(status_code=503, detail="Trending hashtags service unavailable. Configure API keys or enable fallback.")
-
-# Simple health
 @app.get("/health")
 async def health():
-    return {"status":"ok","time":time.time()}
+    return {"status": "ok", "time": time.time()}
+
+# ========== Simple helper route to test local config ==========
+@app.get("/debug/config")
+async def debug_config():
+    return {
+        "has_tiktok_keys": bool(TIKTOK_CLIENT_KEY and TIKTOK_CLIENT_SECRET),
+        "use_unofficial": USE_UNOFFICIAL,
+        "api_host_hint": os.getenv("TIKTOK_API_HOST", "https://open.tiktokapis.com")
+    }
